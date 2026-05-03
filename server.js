@@ -1,106 +1,151 @@
-// ─────────────────────────────────────────────────────────────────
-// MatchedEdge CORS Proxy — server.js
-// Node.js + Express proxy for Betfair API
-// ─────────────────────────────────────────────────────────────────
-// BACKEND FLAG: This server MUST run separately from the frontend.
-// All Betfair endpoints are CORS-blocked in browsers.
-// ─────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+// MatchedEdge CORS Proxy — server.js  v2
+// Node.js 18+ · Express · native fetch (no node-fetch required)
+// ═══════════════════════════════════════════════════════════════════
+// ⚠️  REDEPLOY THIS FILE if you were on v1.
+// Root cause of "invalid json response body" error:
+//   Old proxy called .json() directly on Betfair responses.
+//   Betfair sometimes returns HTML (maintenance / WAF / redirect)
+//   which caused node-fetch to throw, crashing the proxy (HTTP 500).
+// Fix: safeJson() reads .text() first, parses safely — never crashes.
+// ═══════════════════════════════════════════════════════════════════
 
+'use strict';
 const express = require('express');
 const cors    = require('cors');
-const fetch   = require('node-fetch');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
-// ── CORS: Allow your frontend origin ──
+// ── CORS ──
+const ALLOWED = (process.env.ALLOWED_ORIGIN || '*').split(',').map(s => s.trim());
 app.use(cors({
-  origin: process.env.ALLOWED_ORIGIN || '*', // Restrict in production!
-  methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-BF-Token', 'X-Application'],
+  origin: (origin, cb) => {
+    if (ALLOWED.includes('*') || !origin || ALLOWED.includes(origin)) return cb(null, true);
+    cb(new Error(`CORS: origin ${origin} not allowed`));
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type'],
+  credentials: true,
 }));
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 
-// ── Betfair Identity (Login) ──
-// BACKEND FLAG: certlogin requires client certificate (.crt + .key)
-// For non-interactive login, use the API-NG Bot Login instead.
-app.post('/api/betfair/login', async (req, res) => {
-  const { username, password, appKey } = req.body;
-  if (!username || !password || !appKey) {
-    return res.status(400).json({ error: 'username, password, appKey required' });
-  }
+// ── Safe fetch with timeout ──
+async function bfFetch(url, options, ms = 12000) {
+  const ctrl  = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  let r;
   try {
-    const params = new URLSearchParams({ username, password });
-    const resp = await fetch('https://identitysso.betfair.com/api/login', {
+    r = await fetch(url, { ...options, signal: ctrl.signal });
+  } catch (err) {
+    clearTimeout(timer);
+    if (err.name === 'AbortError') throw new Error(`Request timed out after ${ms}ms`);
+    throw err;
+  }
+  clearTimeout(timer);
+  return r;
+}
+
+// ── safeJson: reads .text() first, then JSON.parse ──
+// Prevents crashes when Betfair returns HTML error pages.
+async function safeJson(r, fallbackKey = 'error') {
+  const raw = await r.text();
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch (_) {
+    const snippet = raw.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 300);
+    data = { [fallbackKey]: `Betfair returned a non-JSON response (HTML/plain text). Snippet: ${snippet || '(empty)'}` };
+  }
+  return { data, ok: r.ok, status: r.status };
+}
+
+// ── POST /api/betfair/login ──
+app.post('/api/betfair/login', async (req, res) => {
+  const { username, password, appKey } = req.body || {};
+  if (!username || !password || !appKey)
+    return res.status(400).json({ status: 'FAIL', error: 'username, password and appKey are all required' });
+  try {
+    const r = await bfFetch('https://identitysso.betfair.com/api/login', {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Accept': 'application/json',
+        'Content-Type':  'application/x-www-form-urlencoded',
+        'Accept':        'application/json',
         'X-Application': appKey,
       },
-      body: params.toString(),
+      body: new URLSearchParams({ username, password }).toString(),
     });
-    const data = await resp.json();
-    res.json(data); // { token, status, error }
+    const { data, status } = await safeJson(r, 'error');
+    // Normalise: Betfair may return { status, token } or { loginStatus, sessionToken }
+    const normalised = {
+      status: data.status || data.loginStatus || (data.token || data.sessionToken ? 'SUCCESS' : 'FAIL'),
+      token:  data.token  || data.sessionToken || '',
+      error:  data.error  || data.loginStatus  || '',
+    };
+    res.status(status).json(normalised);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(502).json({ status: 'FAIL', error: err.message });
   }
 });
 
-// ── Betfair Betting API (all JSON-RPC calls) ──
-// BACKEND FLAG: Requires valid session token from login.
+// ── POST /api/betfair/betting ──
 app.post('/api/betfair/betting', async (req, res) => {
-  const { sessionToken, appKey, endpoint, body: bfBody } = req.body;
-  if (!sessionToken || !appKey) {
-    return res.status(401).json({ error: 'sessionToken and appKey required' });
-  }
-  const BF_API = 'https://api.betfair.com/exchange/betting/json-rpc/v1';
+  const { sessionToken, appKey, body: bfBody } = req.body || {};
+  if (!sessionToken) return res.status(401).json({ error: 'sessionToken required' });
+  if (!appKey)       return res.status(401).json({ error: 'appKey required' });
+  if (!bfBody)       return res.status(400).json({ error: 'body (JSON-RPC payload) required' });
   try {
-    const resp = await fetch(BF_API, {
+    const r = await bfFetch('https://api.betfair.com/exchange/betting/json-rpc/v1', {
       method: 'POST',
       headers: {
-        'Content-Type':   'application/json',
-        'Accept':         'application/json',
+        'Content-Type':     'application/json',
+        'Accept':           'application/json',
         'X-Authentication': sessionToken,
         'X-Application':    appKey,
       },
       body: JSON.stringify(bfBody),
     });
-    const data = await resp.json();
-    res.json(data);
+    const { data, status } = await safeJson(r, 'error');
+    res.status(status).json(data);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(502).json({ error: err.message });
   }
 });
 
-// ── Accounts API ──
-app.post('/api/betfair/login', async (req, res) => {
-  const { username, password, appKey } = req.body;
+// ── POST /api/betfair/accounts ──
+app.post('/api/betfair/accounts', async (req, res) => {
+  const { sessionToken, appKey, body: bfBody } = req.body || {};
+  if (!sessionToken) return res.status(401).json({ error: 'sessionToken required' });
+  if (!appKey)       return res.status(401).json({ error: 'appKey required' });
   try {
-    const resp = await fetch('https://identitysso.betfair.com/api/login', {
+    const r = await bfFetch('https://api.betfair.com/exchange/account/json-rpc/v1', {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'X-Application': appKey,
-        'Accept': 'application/json'
+        'Content-Type':     'application/json',
+        'Accept':           'application/json',
+        'X-Authentication': sessionToken,
+        'X-Application':    appKey,
       },
-      body: username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}
+      body: JSON.stringify(bfBody || []),
     });
-    const data = await resp.json();
-    res.json(data);
+    const { data, status } = await safeJson(r, 'error');
+    res.status(status).json(data);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(502).json({ error: err.message });
   }
 });
-:sob:
-Click to react
-:joy:
-Click to react
-:white_check_mark:
-Click to react
-Add Reaction
-Edit
-Forward
-More
 
-Message @Bloxlink
+// ── GET /health ──
+app.get('/health', (_, res) => {
+  res.json({ status: 'ok', ts: new Date().toISOString(), node: process.version, version: '2' });
+});
+
+// ── Global error handler ──
+app.use((err, _req, res, _next) => {
+  console.error('[proxy]', err.message);
+  res.status(500).json({ error: err.message });
+});
+
+app.listen(PORT, '0.0.0.0', () =>
+  console.log(`[MatchedEdge proxy v2] port ${PORT} · Node ${process.version}`)
+);
