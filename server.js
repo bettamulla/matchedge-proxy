@@ -74,19 +74,17 @@ app.post('/api/betfair/betting', async (req, res) => {
 });
 
 // ── Accounts API ──
-app.post('/api/betfair/accounts', async (req, res) => {
-  const { sessionToken, appKey, body: bfBody } = req.body;
-  const ACCT_API = 'https://api.betfair.com/exchange/account/json-rpc/v1';
+app.post('/api/betfair/login', async (req, res) => {
+  const { username, password, appKey } = req.body;
   try {
-    const resp = await fetch(ACCT_API, {
+    const resp = await fetch('https://identitysso.betfair.com/api/login', {
       method: 'POST',
       headers: {
-        'Content-Type':     'application/json',
-        'Accept':           'application/json',
-        'X-Authentication': sessionToken,
-        'X-Application':    appKey,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'X-Application': appKey,
+        'Accept': 'application/json'
       },
-      body: JSON.stringify(bfBody),
+      body: username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}
     });
     const data = await resp.json();
     res.json(data);
@@ -94,10 +92,15 @@ app.post('/api/betfair/accounts', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+:sob:
+Click to react
+:joy:
+Click to react
+:white_check_mark:
+Click to react
+Add Reaction
+Edit
+Forward
+More
 
-// ── Health check ──
-app.get('/health', (_, res) => res.json({ status: 'ok', ts: new Date() }));
-
-app.listen(PORT, () => {
-  console.log(`MatchedEdge proxy running on port ${PORT}`);
-});
+Message @Bloxlink
