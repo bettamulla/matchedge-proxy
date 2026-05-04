@@ -1,3 +1,15 @@
+// ═══════════════════════════════════════════════════════════════════
+// MatchedEdge CORS Proxy — server.js  v2
+// Node.js 18+ · Express · native fetch (no node-fetch required)
+// ═══════════════════════════════════════════════════════════════════
+// ⚠️  REDEPLOY THIS FILE if you were on v1.
+// Root cause of "invalid json response body" error:
+//   Old proxy called .json() directly on Betfair responses.
+//   Betfair sometimes returns HTML (maintenance / WAF / redirect)
+//   which caused node-fetch to throw, crashing the proxy (HTTP 500).
+// Fix: safeJson() reads .text() first, parses safely — never crashes.
+// ═══════════════════════════════════════════════════════════════════
+
 'use strict';
 const express = require('express');
 const cors    = require('cors');
